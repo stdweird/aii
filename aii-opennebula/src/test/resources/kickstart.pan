@@ -1,4 +1,4 @@
-object template basic;
+object template kickstart;
 
 include 'vm';
 

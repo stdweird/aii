@@ -8,6 +8,7 @@ package NCM::Component::ks;
 
 use strict;
 use warnings;
+use version;
 use NCM::Component;
 use EDG::WP4::CCM::Property;
 use EDG::WP4::CCM::Element qw (unescape);
@@ -80,9 +81,9 @@ use constant   USEMODULE        => "use " . MODULEBASE;
 #   190 = local7.info
 use constant LOG_ACTION_SYSLOGHEADER => '<190>AII: '; 
 # awk command to prefix LOG_ACTION_SYSLOGHEADER and 
-# to insert sleep (usleep by initscripts), throtlles to 40 lines per sec
+# to insert sleep (usleep by initscripts), throtlles to max 1000 lines per sec
 use constant LOG_ACTION_AWK => 
-    "awk '{print \"".LOG_ACTION_SYSLOGHEADER."\"\$0; fflush(); system(\"usleep 25000 >& /dev/null\");}'";
+    "awk '{print \"".LOG_ACTION_SYSLOGHEADER."\"\$0; fflush(); system(\"usleep 1000 >& /dev/null\");}'";
 
 
 # Configuration variable for the osinstall directory.
@@ -159,30 +160,128 @@ End_Of_Post_Reboot
 EOF
 }
 
+# Determine the network device name, and return the 
+# device ip configuration and any additional network 
+# options (e.g. to handle with bonding)  
+sub ksnetwork_get_dev_net
+{
+    my ($tree, $config) = @_; 
+    
+    my @networkopts = ();
+    my $version = get_anaconda_version($tree);
+
+    my $dev = $config->getElement("/system/aii/nbp/pxelinux/ksdevice")->getValue;
+    if ($dev =~ m!(?:[0-9a-f][0-9a-f](?::[0-9][0-9]){5})|bootif|link!i) {
+        $this_app->error("Invalid ksdevice $dev for static ks configuration.");
+        return;
+    }
+
+    my $net = $config->getElement("/system/network/interfaces/$dev")->getTree;
+
+    # check for bonding 
+    my $bonddev = $net->{master};
+    # check the existence to deal with older profiles
+    if (exists($tree->{bonding}) && (! $tree->{bonding})) {
+        my $msg = "Bonding config generation explicitly disabled";
+        $this_app->debug (5, $msg);
+        # lets hope you know what you are doing
+        $this_app->warn ("$msg for dev $dev, with master $bonddev set.") if ($bonddev);
+    } elsif ($version >= ANACONDA_VERSION_EL_6_0 && $bonddev ) {
+        # this is the dhcp code logic; adding extra error here. 
+        if (!($net->{bootproto} && $net->{bootproto} eq "none")) {
+            $this_app->warn("Pretending this a bonded setup with bonddev $bonddev (and ksdevice $dev).",
+                             "But bootproto=none is missing, so ncm-network will not treat it as one.");
+        }
+        $this_app->debug (5, "Ksdevice $dev is a bonding slave, node will boot from bonding device $bonddev");
+
+        # network settings are part of the bond master
+        my $intfs = $config->getElement("/system/network/interfaces")->getTree;
+        $net = $intfs->{$bonddev};
+        
+        # gather the slaves, the ksdevice is put first 
+        my @slaves;
+        push(@slaves, $dev);
+        foreach my $intf (sort keys %$intfs) {
+            push (@slaves, $intf) if ($intfs->{$intf}->{master} && 
+                                      $intfs->{$intf}->{master} eq $bonddev &&
+                                      !(grep { $_ eq $intf } @slaves));
+        };
+
+        push(@networkopts, "--bondslaves=".join(',', @slaves));
+
+        # gather the options
+        if ($net->{bonding_opts}) {
+            my @opts;
+            while (my ($k, $v) = each(%{$net->{bonding_opts}})) {
+                push(@opts, "$k=$v");
+            }
+            push(@networkopts, "--bondopts=".join(',', @opts));
+        }
+        
+        # continue with the bond device as network device
+        $dev = $bonddev;
+        
+    }
+    
+    return ($dev, $net, @networkopts);
+
+}    
+
+
 # Configures the network, allowing both DHCP and static boots.
 sub ksnetwork
 {
     my ($tree, $config) = @_;
 
+    my @network = qw(network);
+
     if ($tree->{bootproto} eq 'dhcp') {
+        # TODO: no boot device selection with dhcp (e.g. needed for bonding)
+        # Although fully supported in ks and easy to add, 
+        # the issue here is backwards compatibilty (a.k.a. very old behaviour)
         $this_app->debug (5, "Node configures its network via DHCP");
-        print "network --bootproto=dhcp\n";
-        return;
+        push(@network, "--bootproto=dhcp");
+        return @network;
     }
 
-    my $dev = $config->getElement("/system/aii/nbp/pxelinux/ksdevice")->getValue;
+    push(@network, "--bootproto=static");
+
+    my ($dev, $net, @networkopts) = ksnetwork_get_dev_net($tree, $config);
+    push(@network, @networkopts);
+
     $this_app->debug (5, "Node will boot from $dev");
-
+    push(@network, "--device=$dev");
+    
     my $fqdn = get_fqdn($config);
+    push(@network, "--hostname=$fqdn");
 
-    my $net = $config->getElement("/system/network/interfaces/$dev")->getTree;
+    my $ns = $config->getElement(NAMESERVER)->getValue;
+    push(@network, "--nameserver=$ns");
+
+    # from now on, only IP related settings
+    
+    # check for bridge: if $dev is a bridge interface, 
+    # continue with network settings on the bridge device
+    # (do this here, i.e. after --device is set)
+    if ($net->{bridge}) {
+        my $brdev = $net->{bridge}; 
+        $this_app->debug (5, "Device $dev is a bridge interface for bridge $brdev.");
+        # continue with network settings for the bridge device
+        $net = $config->getElement("/system/network/interfaces/$brdev")->getTree;
+        # warning: $dev is changed here to the bridge device to create correct log 
+        # messages in remainder of this method. as there is not bridge device 
+        # in anaconda phase, the new value of $dev is not an actual network device!
+        $dev = $brdev;
+    }
+    
     unless ($net->{ip}) {
             $this_app->error ("Static boot protocol specified ",
                               "but no IP given to the interface $dev");
-            return;
+            return ();
     }
+    push(@network, "--ip=$net->{ip}", "--netmask=$net->{netmask}");
 
-    my $mtu = $net->{mtu} ? "--mtu=$net->{mtu} " : "";
+    push(@network, "--mtu=$net->{mtu}") if $net->{mtu};
 
     my $gw = '--gateway=';
     if ($net->{gateway}) {
@@ -202,12 +301,9 @@ sub ksnetwork
 ## Lets hope all is reachable through direct route.
 EOF
     };
+    push(@network, $gw);
 
-    my $ns = $config->getElement(NAMESERVER)->getValue;
-    print <<EOF;
-network --bootproto=static --ip=$net->{ip} --netmask=$net->{netmask} $gw --nameserver=$ns --device=$dev --hostname=$fqdn $mtu
-EOF
-
+    return @network;
 }
 
 # Instantiates and executes the user hooks for a given path.
@@ -265,7 +361,7 @@ sub kscommands
     push(@packages, 'bind-utils'); # required for nslookup usage in ks-post-install
     
     my $installtype = $tree->{installtype};
-    if ($installtype =~ /^http/) {
+    if ($installtype =~ /http/) {
         my ($proxyhost, $proxyport, $proxytype) = proxy($config);
         if ($proxyhost) {
             if ($proxyport) {
@@ -351,7 +447,7 @@ EOF
     print "--port $_ " foreach @{$tree->{firewall}->{ports}};
     print "\n";
 
-    ksnetwork ($tree, $config);
+    print join(" ",ksnetwork ($tree, $config)), "\n";
 
     print "driverdisk --source=$_\n" foreach @{$tree->{driverdisk}};
     if ($tree->{clearmbr}) {
@@ -491,6 +587,8 @@ sub log_action {
 
     my $tree = $config->getElement(KS)->getTree;
     my @logactions;
+    my $drainsleep = 0;
+    
     push(@logactions, "exec >$logfile 2>&1"); 
 
     # when changing any of the behaviour    
@@ -529,6 +627,9 @@ sub log_action {
 
             # insert extra sleep to get all started before any output is send
             push(@logactions, 'sleep 1');
+            
+            # fix drain sleep to 10 seconds
+            $drainsleep = 10;
         }
     }
 
@@ -537,6 +638,7 @@ sub log_action {
                           "tail -f $logfile > /dev/console &");
     }
     
+    push(@logactions,"drainsleep=$drainsleep"); # add trailing newline 
     push(@logactions,''); # add trailing newline 
     return join("\n", @logactions)
 }
@@ -611,14 +713,25 @@ end_of_fdisk
 }
 
 wipe_metadata () {
-    local path clear SIZE START
+    local path clear SIZE ENDSEEK ENDSEEK_OFFSET
     path="$1"
-    clear="$2"
-
-    SIZE=`fdisk -s "$path"`
-    let START=$SIZE/1024-$clear
-    dd if=/dev/zero of="$path" bs=1M count=$clear 2>/dev/null
-    dd if=/dev/zero of="$path" bs=1M seek=$START 2>/dev/null
+	ENDSEEK_OFFSET=20
+    # try to get the size with fdisk
+    SIZE=`fdisk -lu "$path" |grep total|grep sectors|awk -F ' ' '{print $8}'`
+    # if empty, assume we failed and try with parted
+    if [ -z $SIZE ]; then
+        SIZE=`parted "$path" -s -- u s p | grep "Disk $path" |awk '{print substr($3, 0, length($3)-1)}'`
+        # if at this point the SIZE has not been determined, 
+        # set it equal to ENDSEEK_OFFSET, the entire disk gets wiped. 
+        if [ -z $SIZE ]; then
+            SIZE=$ENDSEEK_OFFSET
+            echo "[WARN] Could not determine the size of device $path with both fdisk and parted. Wiping whole drive instead"
+        fi
+    fi
+    let ENDSEEK=$SIZE-$ENDSEEK_OFFSET
+    echo "[INFO] wipe path $path with SIZE $SIZE and ENDSEEK $ENDSEEK"
+    dd if=/dev/zero of="$path" bs=512 count=10 2>/dev/null
+    dd if=/dev/zero of="$path" bs=512 seek=$ENDSEEK 2>/dev/null
 }
 
 EOF
@@ -641,6 +754,10 @@ EOF
 # https://bugzilla.redhat.com/show_bug.cgi?id=652417
 lvm vgchange -an
 echo 'End of pre section'
+
+# Drain remote logger (0 if not relevant)
+sleep \$drainsleep
+
 $end
 
 EOF
@@ -806,7 +923,8 @@ Subject: [\\`date +'%x %R %z'\\`] Quattor installation on $fqdn failed: \\\$1
 
 .
 End_of_sendmail
-    sleep 2
+    # Drain remote logger (0 if not relevant)
+    sleep \\\$drainsleep
     exit 1
 }
 
@@ -822,7 +940,8 @@ Subject: [\\`date +'%x %R %z'\\`] Quattor installation on $fqdn succeeded
 Node $fqdn successfully installed.
 .
 End_of_sendmail
-    sleep 2
+    # Drain remote logger (0 if not relevant)
+    sleep \\\$drainsleep
 }
 
 # Wait for functional network up by testing DNS lookup via nslookup.
@@ -937,7 +1056,10 @@ sub kspostreboot_tail
     print <<EOF;
 rm -f /etc/rc.d/rc3.d/S86ks-post-reboot
 echo 'End of ks-post-reboot'
-sleep 1
+
+# Drain remote logger (0 if not relevant)
+sleep \\\$drainsleep
+
 shutdown -r now
 
 EOF
@@ -1299,7 +1421,10 @@ EOF
     my $end = $config->getElement(END_SCRIPT_FIELD)->getValue();
     print <<EOF;
 echo 'End of post section'
-sleep 1
+
+# Drain remote logger (0 if not relevant)
+sleep \$drainsleep
+
 $end
 
 EOF
