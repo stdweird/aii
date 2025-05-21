@@ -339,7 +339,16 @@ sub _kernel_params_ks
     # With PXELINUX, initrd path is specified with a kernel parameter
     # Parameter order is not important but is kept as "ramdisk, initrd, ks" for compatibility
     # with previous AII versions for easier comparisons.
-    my @kernel_params =  ("ramdisk=32768");
+
+    my $ramdisk_size;
+    if ($pxe_config->{ramdisk_size}) {
+        $ramdisk_size = "ramdisk_size=$pxe_config->{ramdisk_size}";
+    } else {
+        # use legacy syntax and hardcoded value
+        $ramdisk_size = "ramdisk=32768";
+    }
+
+    my @kernel_params =  ($ramdisk_size);
     if ($variant == PXE_VARIANT_PXELINUX) {
         push @kernel_params, "initrd=$initrd_path";
     }
